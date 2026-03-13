@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM="solang-stellar"
+
+usage() {
+  cat <<'USAGE'
+solang-stellar test [options]
+
+Goal:
+  Compile a Solidity contract with Solang, deploy it to Soroban, then invoke a function.
+
+Examples:
+  solang-stellar test --file arr_arg_c.sol --function arr_arg --arr "[1,2]" --network testnet --source-account alice
+  solang-stellar test --function arr_arg --arr "[1,2]"
+
+Options:
+  --file <path>               Solidity source file (default: inferred if only one *.sol in cwd)
+  --function <name>           Function to invoke (required)
+  --contract <name>           Forward to `solang compile --contract`
+  --output <dir>              Forward to `solang compile --output`
+  --emit <kind>               Forward to `solang compile --emit`
+  --strict-soroban-types      Forward to `solang compile --strict-soroban-types`
+  -O <level>                  Forward to `solang compile -O <none|less|default|aggressive>`
+  --wasm-opt <level>          Forward to `solang compile --wasm-opt`
+  --release                   Forward to `solang compile --release`
+  --solang-target <name>      Forward to `solang compile --target <name>`
+  --wasm <path>               Override inferred wasm path for deploy
+  --network <name>            Stellar network profile
+  --source-account <name>     Account for deploy + invoke (or set STELLAR_ACCOUNT)
+  --arg <name=value>          Function argument (repeatable)
+  --<argname> <value>         Function argument passthrough (repeatable)
+  --send <default|no|yes>     Forward to `stellar contract invoke --send`
+  --verbose                   Print exact commands before execution
+  --help                      Show this help
+
+Notes:
+  - Array args should be quoted to avoid shell globbing, e.g. --arr "[1,2]"
+  - If multiple .sol files exist, use --file
+USAGE
+}
+
+err() {
+  printf "%s: %s\n" "$PROGRAM" "$*" >&2
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    err "Missing required command: $1"
+    exit 127
+  }
+}
+
+print_cmd() {
+  printf ">>"
+  for arg in "$@"; do
+    printf " %q" "$arg"
+  done
+  printf "\n"
+}
+
+pretty_block() {
+  local title="$1"
+  local content="$2"
+  printf "\n%s\n" "$title"
+  printf "%s\n" "----------------------------------------"
+  printf "%s\n" "$content"
+}
+
+subcmd="${1:-}"
+if [[ -z "$subcmd" || "$subcmd" == "-h" || "$subcmd" == "--help" ]]; then
+  usage
+  exit 0
+fi
+if [[ "$subcmd" != "test" ]]; then
+  err "Unknown subcommand: $subcmd"
+  usage
+  exit 2
+fi
+shift
+
+file=""
+function_name=""
+network=""
+source_account=""
+wasm_path=""
+output_dir=""
+verbose=0
+solang_target_set=0
+
+compile_args=()
+invoke_args=()
+invoke_opts=()
+arg_kv=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --file)
+      file="$2"
+      shift 2
+      ;;
+    --function)
+      function_name="$2"
+      shift 2
+      ;;
+    --network)
+      network="$2"
+      shift 2
+      ;;
+    --source-account)
+      source_account="$2"
+      shift 2
+      ;;
+    --wasm)
+      wasm_path="$2"
+      shift 2
+      ;;
+    --output)
+      output_dir="$2"
+      compile_args+=("--output" "$2")
+      shift 2
+      ;;
+    --contract)
+      compile_args+=("--contract" "$2")
+      shift 2
+      ;;
+    --emit)
+      compile_args+=("--emit" "$2")
+      shift 2
+      ;;
+    --strict-soroban-types)
+      compile_args+=("--strict-soroban-types")
+      shift
+      ;;
+    -O)
+      compile_args+=("-O" "$2")
+      shift 2
+      ;;
+    --wasm-opt)
+      compile_args+=("--wasm-opt" "$2")
+      shift 2
+      ;;
+    --release)
+      compile_args+=("--release")
+      shift
+      ;;
+    --solang-target)
+      compile_args+=("--target" "$2")
+      solang_target_set=1
+      shift 2
+      ;;
+    --arg)
+      arg_kv+=("$2")
+      shift 2
+      ;;
+    --send)
+      invoke_opts+=("--send" "$2")
+      shift 2
+      ;;
+    --verbose)
+      verbose=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    --*)
+      if [[ $# -lt 2 ]]; then
+        err "Missing value for $1"
+        exit 2
+      fi
+      arg_name="${1#--}"
+      invoke_args+=("--$arg_name" "$2")
+      shift 2
+      ;;
+    *)
+      err "Unexpected argument: $1"
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$file" ]]; then
+  shopt -s nullglob
+  sol_files=( *.sol )
+  shopt -u nullglob
+  if (( ${#sol_files[@]} == 0 )); then
+    err "No .sol files found. Use --file."
+    exit 2
+  fi
+  if (( ${#sol_files[@]} > 1 )); then
+    err "Multiple .sol files found. Use --file."
+    exit 2
+  fi
+  file="${sol_files[0]}"
+fi
+
+if [[ ! -f "$file" ]]; then
+  err "File not found: $file"
+  exit 2
+fi
+
+if [[ -z "$function_name" ]]; then
+  err "--function is required"
+  exit 2
+fi
+
+if [[ -z "$source_account" ]]; then
+  source_account="${STELLAR_ACCOUNT:-}"
+fi
+if [[ -z "$source_account" ]]; then
+  err "--source-account is required (or set STELLAR_ACCOUNT)"
+  exit 2
+fi
+
+if (( ${#arg_kv[@]} > 0 )); then
+  for kv in "${arg_kv[@]}"; do
+    if [[ "$kv" != *"="* ]]; then
+      err "--arg expects name=value (got '$kv')"
+      exit 2
+    fi
+    name="${kv%%=*}"
+    value="${kv#*=}"
+    if [[ -z "$name" ]]; then
+      err "--arg expects name=value (got '$kv')"
+      exit 2
+    fi
+    invoke_args+=("--$name" "$value")
+  done
+fi
+
+need_cmd "solang"
+need_cmd "stellar"
+
+if [[ -z "$output_dir" ]]; then
+  output_dir=".solang-stellar-test/out"
+  compile_args+=("--output" "$output_dir")
+fi
+mkdir -p "$output_dir"
+
+if (( solang_target_set == 0 )) && [[ -n "${SOLANG_TARGET:-}" ]]; then
+  compile_args+=("--target" "${SOLANG_TARGET}")
+fi
+
+network_args=()
+if [[ -n "$network" ]]; then
+  network_args+=("--network" "$network")
+fi
+
+compile_cmd=(solang compile "$file" "${compile_args[@]}")
+if (( verbose )); then
+  print_cmd "${compile_cmd[@]}"
+fi
+printf "[1/3] Compile: "
+if "${compile_cmd[@]}"; then
+  printf "OK\n"
+else
+  printf "FAIL\n"
+  exit 1
+fi
+
+if [[ -z "$wasm_path" ]]; then
+  base_name="$(basename "$file" .sol)"
+  candidate="$output_dir/$base_name.wasm"
+  if [[ -f "$candidate" ]]; then
+    wasm_path="$candidate"
+  else
+    shopt -s nullglob
+    wasm_candidates=("$output_dir"/*.wasm)
+    shopt -u nullglob
+    if (( ${#wasm_candidates[@]} == 0 )); then
+      err "No .wasm found in $output_dir. Use --wasm or --output."
+      exit 2
+    fi
+    if (( ${#wasm_candidates[@]} > 1 )); then
+      err "Multiple .wasm files found in $output_dir. Use --wasm or --contract."
+      exit 2
+    fi
+    wasm_path="${wasm_candidates[0]}"
+  fi
+fi
+
+if [[ ! -f "$wasm_path" ]]; then
+  err "WASM not found: $wasm_path"
+  exit 2
+fi
+
+deploy_cmd=(stellar contract deploy --source-account "$source_account" "${network_args[@]}" --wasm "$wasm_path")
+if (( verbose )); then
+  print_cmd "${deploy_cmd[@]}"
+fi
+printf "[2/3] Deploy: "
+if deploy_out=$("${deploy_cmd[@]}" 2>&1); then
+  contract_id=$(printf "%s\n" "$deploy_out" | grep -Eo 'C[A-Z0-9]{55,}' | head -n1 || true)
+  if [[ -z "$contract_id" ]]; then
+    printf "FAIL\n"
+    err "Could not parse contract ID from deploy output"
+    printf "%s\n" "$deploy_out" >&2
+    exit 1
+  fi
+  printf "OK (ID=%s)\n" "$contract_id"
+else
+  printf "FAIL\n"
+  printf "%s\n" "$deploy_out" >&2
+  exit 1
+fi
+
+invoke_cmd=(stellar contract invoke --id "$contract_id" --source-account "$source_account")
+if (( ${#network_args[@]} > 0 )); then
+  invoke_cmd+=("${network_args[@]}")
+fi
+if (( ${#invoke_opts[@]} > 0 )); then
+  invoke_cmd+=("${invoke_opts[@]}")
+fi
+invoke_cmd+=(-- "$function_name")
+if (( ${#invoke_args[@]} > 0 )); then
+  invoke_cmd+=("${invoke_args[@]}")
+fi
+if (( verbose )); then
+  print_cmd "${invoke_cmd[@]}"
+fi
+printf "[3/3] Invoke: "
+if invoke_out=$("${invoke_cmd[@]}" 2>&1); then
+  printf "OK\n"
+else
+  printf "FAIL\n"
+  printf "%s\n" "$invoke_out" >&2
+  exit 1
+fi
+
+printf "\ncontract_id=%s\n" "$contract_id"
+printf "function=%s\n" "$function_name"
+if (( ${#invoke_args[@]} > 0 )); then
+  # Print args in a readable, flat format
+  args_line=""
+  i=0
+  while (( i < ${#invoke_args[@]} )); do
+    key="${invoke_args[$i]}"; val="${invoke_args[$((i+1))]}"
+    if [[ -n "$args_line" ]]; then
+      args_line+=", "
+    fi
+    args_line+="${key#--}:$val"
+    i=$((i+2))
+  done
+  printf "args=%s\n" "$args_line"
+fi
+printf "result=%s\n" "$invoke_out"
+printf "SOLANG_STELLAR_RESULT='%s'\n" "{\"contract_id\":\"$contract_id\",\"result\":\"$invoke_out\"}"
+
+if (( verbose )); then
+  pretty_block "Deploy output:" "$deploy_out"
+  pretty_block "Invoke output:" "$invoke_out"
+fi

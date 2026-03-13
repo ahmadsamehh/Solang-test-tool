@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="260" viewBox="0 0 960 260">
+  <defs>
+    <style>
+      .box { fill: #f6f1e3; stroke: #1f2937; stroke-width: 2; rx: 10; }
+      .title { font: 700 18px 'Trebuchet MS', Arial, sans-serif; fill: #111827; }
+      .text { font: 14px 'Trebuchet MS', Arial, sans-serif; fill: #374151; }
+      .arrow { stroke: #1f2937; stroke-width: 2; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#1f2937" />
+    </marker>
+  </defs>
+
+  <rect class="box" x="40" y="70" width="240" height="120" />
+  <text class="title" x="70" y="110">1) Compile</text>
+  <text class="text" x="70" y="135">solang compile</text>
+  <text class="text" x="70" y="155">.sol -> .wasm</text>
+
+  <rect class="box" x="360" y="70" width="240" height="120" />
+  <text class="title" x="390" y="110">2) Deploy</text>
+  <text class="text" x="390" y="135">stellar contract</text>
+  <text class="text" x="390" y="155">deploy -> contract ID</text>
+
+  <rect class="box" x="680" y="70" width="240" height="120" />
+  <text class="title" x="710" y="110">3) Invoke</text>
+  <text class="text" x="710" y="135">stellar contract</text>
+  <text class="text" x="710" y="155">invoke -> result</text>
+
+  <line class="arrow" x1="280" y1="130" x2="360" y2="130" />
+  <line class="arrow" x1="600" y1="130" x2="680" y2="130" />
+</svg>
