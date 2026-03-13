@@ -85,10 +85,3 @@ SOLANG_STELLAR_RESULT='{"contract_id":"CA...","result":"20"}'
 - **"Multiple .wasm files found"**
   - Use `--contract` or `--wasm` to be explicit.
 
-## Roadmap ideas 🗺️
-- Cache deployed contracts to avoid redeploying
-- `--watch` mode for auto recompile/redeploy
-- `--json` output for CI
-
-## License 📝
-MIT (add a LICENSE file if needed)
