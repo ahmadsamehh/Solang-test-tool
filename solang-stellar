@@ -11,7 +11,7 @@ Goal:
   Compile a Solidity contract with Solang, deploy it to Soroban, then invoke a function.
 
 Examples:
-  solang-stellar test --file arr_arg_c.sol --function arr_arg --arr "[1,2]" --network testnet --source-account alice
+  solang-stellar test --file arr_arg_c.sol --function arr_arg --arr "[1,2]"
   solang-stellar test --function arr_arg --arr "[1,2]"
 
 Options:
@@ -24,10 +24,9 @@ Options:
   -O <level>                  Forward to `solang compile -O <none|less|default|aggressive>`
   --wasm-opt <level>          Forward to `solang compile --wasm-opt`
   --release                   Forward to `solang compile --release`
-  --solang-target <name>      Forward to `solang compile --target <name>`
+  --solang-target <name>      Forward to `solang compile --target <name>` (default: soroban)
   --wasm <path>               Override inferred wasm path for deploy
-  --network <name>            Stellar network profile
-  --source-account <name>     Account for deploy + invoke (or set STELLAR_ACCOUNT)
+  --network <name>            Stellar network profile (default: testnet)
   --arg <name=value>          Function argument (repeatable)
   --<argname> <value>         Function argument passthrough (repeatable)
   --send <default|no|yes>     Forward to `stellar contract invoke --send`
@@ -37,10 +36,16 @@ Options:
 Notes:
   - Array args should be quoted to avoid shell globbing, e.g. --arr "[1,2]"
   - If multiple .sol files exist, use --file
+  - Warning: generate a Stellar key before using this tool
+  - If STELLAR_ACCOUNT is set, it will be used; otherwise the Stellar CLI default key is used
 USAGE
 }
 
 err() {
+  printf "%s: %s\n" "$PROGRAM" "$*" >&2
+}
+
+note() {
   printf "%s: %s\n" "$PROGRAM" "$*" >&2
 }
 
@@ -67,6 +72,75 @@ pretty_block() {
   printf "%s\n" "$content"
 }
 
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf "%s" "$s"
+}
+
+detect_default_key() {
+  local keys_out=""
+  local line=""
+  local name=""
+  local count=0
+  local only=""
+  local cmd=""
+
+  for cmd in list ls; do
+    keys_out="$(stellar keys "$cmd" 2>/dev/null || true)"
+    [[ -n "$keys_out" ]] && break
+  done
+
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*No[[:space:]]+keys ]]; then
+      continue
+    fi
+    if [[ "$line" =~ ^(NAME|Name|Keys|Key)[[:space:]]*$ ]]; then
+      continue
+    fi
+    if [[ "$line" =~ ^-+$ ]]; then
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*\* ]]; then
+      line="${line#\*}"
+      line="${line#"${line%%[![:space:]]*}"}"
+      name="${line%%[[:space:]]*}"
+      [[ -n "$name" ]] && { printf "%s\n" "$name"; return 0; }
+    fi
+    if [[ "$line" == *"(default)"* ]]; then
+      line="${line//(default)/}"
+      line="${line#"${line%%[![:space:]]*}"}"
+      name="${line%%[[:space:]]*}"
+      [[ -n "$name" ]] && { printf "%s\n" "$name"; return 0; }
+    fi
+    if [[ "$line" =~ default[[:space:]]*:[[:space:]]* ]]; then
+      name="${line#*default:}"
+      name="${name#"${name%%[![:space:]]*}"}"
+      name="${name%%[[:space:]]*}"
+      [[ -n "$name" ]] && { printf "%s\n" "$name"; return 0; }
+    fi
+    if [[ ! "$line" =~ ^[[:space:]]*\*?[A-Za-z0-9._-]+ ]]; then
+      continue
+    fi
+    count=$((count+1))
+    only="$line"
+  done <<< "$keys_out"
+
+  if (( count == 1 )); then
+    name="${only%%[[:space:]]*}"
+    [[ -n "$name" ]] && { printf "%s\n" "$name"; return 0; }
+  fi
+
+  return 1
+}
+
 subcmd="${1:-}"
 if [[ -z "$subcmd" || "$subcmd" == "-h" || "$subcmd" == "--help" ]]; then
   usage
@@ -81,7 +155,7 @@ shift
 
 file=""
 function_name=""
-network=""
+network="testnet"
 source_account=""
 wasm_path=""
 output_dir=""
@@ -105,10 +179,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --network)
       network="$2"
-      shift 2
-      ;;
-    --source-account)
-      source_account="$2"
       shift 2
       ;;
     --wasm)
@@ -219,12 +289,15 @@ if [[ -z "$function_name" ]]; then
   exit 2
 fi
 
+source_account="${STELLAR_ACCOUNT:-}"
 if [[ -z "$source_account" ]]; then
-  source_account="${STELLAR_ACCOUNT:-}"
-fi
-if [[ -z "$source_account" ]]; then
-  err "--source-account is required (or set STELLAR_ACCOUNT)"
-  exit 2
+  source_account="$(detect_default_key || true)"
+  if [[ -n "$source_account" ]]; then
+    note "STELLAR_ACCOUNT not set. Using Stellar CLI default key: $source_account"
+  else
+    err "No Stellar key found. Generate one or set STELLAR_ACCOUNT."
+    exit 2
+  fi
 fi
 
 if (( ${#arg_kv[@]} > 0 )); then
@@ -252,8 +325,12 @@ if [[ -z "$output_dir" ]]; then
 fi
 mkdir -p "$output_dir"
 
-if (( solang_target_set == 0 )) && [[ -n "${SOLANG_TARGET:-}" ]]; then
-  compile_args+=("--target" "${SOLANG_TARGET}")
+if (( solang_target_set == 0 )); then
+  if [[ -n "${SOLANG_TARGET:-}" ]]; then
+    compile_args+=("--target" "${SOLANG_TARGET}")
+  else
+    compile_args+=("--target" "soroban")
+  fi
 fi
 
 network_args=()
@@ -299,7 +376,11 @@ if [[ ! -f "$wasm_path" ]]; then
   exit 2
 fi
 
-deploy_cmd=(stellar contract deploy --source-account "$source_account" "${network_args[@]}" --wasm "$wasm_path")
+deploy_cmd=(stellar contract deploy)
+if [[ -n "$source_account" ]]; then
+  deploy_cmd+=(--source-account "$source_account")
+fi
+deploy_cmd+=("${network_args[@]}" --wasm "$wasm_path")
 if (( verbose )); then
   print_cmd "${deploy_cmd[@]}"
 fi
@@ -319,7 +400,10 @@ else
   exit 1
 fi
 
-invoke_cmd=(stellar contract invoke --id "$contract_id" --source-account "$source_account")
+invoke_cmd=(stellar contract invoke --id "$contract_id")
+if [[ -n "$source_account" ]]; then
+  invoke_cmd+=(--source-account "$source_account")
+fi
 if (( ${#network_args[@]} > 0 )); then
   invoke_cmd+=("${network_args[@]}")
 fi
@@ -359,7 +443,31 @@ if (( ${#invoke_args[@]} > 0 )); then
   printf "args=%s\n" "$args_line"
 fi
 printf "result=%s\n" "$invoke_out"
-printf "SOLANG_STELLAR_RESULT='%s'\n" "{\"contract_id\":\"$contract_id\",\"result\":\"$invoke_out\"}"
+
+result_value="$invoke_out"
+invoke_notice=""
+if [[ "$invoke_out" == *$'\n'* ]]; then
+  first_line="${invoke_out%%$'\n'*}"
+  rest="${invoke_out#*$'\n'}"
+  if [[ "$first_line" == "ℹ️ "* || "$first_line" == "info:"* || "$first_line" == "INFO:"* ]]; then
+    invoke_notice="$first_line"
+    result_value="$rest"
+  fi
+fi
+result_value="$(printf "%s" "$result_value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+
+json_contract_id="$(json_escape "$contract_id")"
+json_function="$(json_escape "$function_name")"
+json_result="$(json_escape "$result_value")"
+json_args=""
+json_notice=""
+if [[ -n "$args_line" ]]; then
+  json_args=",\"args\":\"$(json_escape "$args_line")\""
+fi
+if [[ -n "$invoke_notice" ]]; then
+  json_notice=",\"notice\":\"$(json_escape "$invoke_notice")\""
+fi
+printf "SOLANG_STELLAR_RESULT='%s'\n" "{\"contract_id\":\"$json_contract_id\",\"function\":\"$json_function\",\"result\":\"$json_result\"$json_args$json_notice}"
 
 if (( verbose )); then
   pretty_block "Deploy output:" "$deploy_out"
